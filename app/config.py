@@ -28,3 +28,11 @@ CONFIDENCE_THRESHOLD = 0.6
 # Configuración de imágenes
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+
+# Configuración de ESPs
+ESP32_BRIDGE_URL = os.getenv("ESP32_BRIDGE_URL", "http://192.168.1.100")
+ESP32_CAM_URL = os.getenv("ESP32_CAM_URL", "http://192.168.1.101")
+
+# Intervalos de polling (ms)
+SENSOR_POLL_INTERVAL = 1000  # 1s para sensor
+CAM_POLL_INTERVAL = 2000     # 2s para cámara

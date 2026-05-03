@@ -5,7 +5,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from app.routes import recognition
+#from app.routes import recognition
+from app.routes import esp
 
 # Crear aplicación FastAPI
 app = FastAPI(
@@ -24,10 +25,16 @@ app.add_middleware(
 )
 
 # Incluir routers
+#app.include_router(
+#    recognition.router,
+#    prefix="/api/v1",
+#    tags=["Face Recognition"]
+#)
+
 app.include_router(
-    recognition.router,
-    prefix="/api/v1",
-    tags=["Face Recognition"]
+    esp.router,
+    prefix="/api/v1/esp",
+    tags=["ESP32 Devices"]
 )
 
 
