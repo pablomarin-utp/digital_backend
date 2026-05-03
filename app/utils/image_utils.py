@@ -5,7 +5,7 @@ import io
 import numpy as np
 import cv2
 from PIL import Image
-from typing import Optional
+from typing import Optional, Tuple
 
 
 def bytes_to_numpy(image_bytes: bytes) -> Optional[np.ndarray]:
@@ -119,4 +119,3 @@ def resize_image(image: np.ndarray, max_width: int = 1024, max_height: int = 102
     return image
 
 
-from typing import Tuple  # Añadir import que faltaba

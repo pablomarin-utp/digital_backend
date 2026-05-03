@@ -1,6 +1,7 @@
 """
 Endpoints de la API de reconocimiento facial
 """
+import cv2
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -195,19 +196,53 @@ async def get_status():
 
 @router.get("/people")
 async def list_people():
-    """
-    Lista todas las personas registradas en el sistema
-    
-    Returns:
-        Lista de personas con estadísticas
-    """
     try:
         status = face_recognizer.get_status()
-        
+        return {"total_people": status["total_people"], "people": status["people"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+
+
+@router.post("/enroll_capture")
+async def enroll_from_capture(name: str = Form(...), file_path: str = Form(...)):
+    """
+    Guarda una captura ya existente en disco como foto de entrenamiento de una persona.
+    Luego recalcula automáticamente el modelo — no hace falta pulsar Reentrenar.
+    """
+    try:
+        name = name.strip()
+        print(f"[enroll_capture] name='{name}' file_path='{file_path}'")
+
+        if not name:
+            raise HTTPException(status_code=400, detail="El nombre no puede estar vacío")
+
+        import os
+        exists = os.path.isfile(file_path)
+        print(f"[enroll_capture] archivo existe: {exists} | cwd: {os.getcwd()}")
+        if not exists:
+            raise HTTPException(status_code=400, detail=f"Archivo no encontrado: {file_path}")
+
+        img = cv2.imread(file_path)
+        print(f"[enroll_capture] cv2.imread resultado: {None if img is None else img.shape}")
+        if img is None:
+            raise HTTPException(status_code=400, detail=f"cv2 no pudo leer la imagen: {file_path}")
+
+        success, msg, _ = face_recognizer.add_person(name, img)
+        print(f"[enroll_capture] add_person → success={success} msg='{msg}'")
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        # Reentrenar automáticamente (tarda ~1-3 s)
+        face_recognizer.train_classifier()
+
+        status = face_recognizer.get_status()
         return {
+            "success": True,
+            "message": msg,
             "total_people": status["total_people"],
-            "people": status["people"]
+            "total_samples": status["total_samples"],
         }
-    
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
