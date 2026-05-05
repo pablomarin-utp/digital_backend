@@ -10,6 +10,7 @@ import uvicorn
 
 from app.routes import esp
 from app.routes import recognition
+from app.routes import auth as auth_routes
 from app.routes.esp import motion_capture_loop
 
 
@@ -37,6 +38,7 @@ app.add_middleware(
 
 app.include_router(esp.router, prefix="/api/v1/esp", tags=["ESP32"])
 app.include_router(recognition.router, prefix="/api/v1", tags=["Face Recognition"])
+app.include_router(auth_routes.router, prefix="/api/v1/auth", tags=["Auth"])
 
 
 @app.get("/")
