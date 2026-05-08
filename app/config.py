@@ -3,6 +3,9 @@ Configuración de la aplicación
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Directorios base
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -29,7 +32,14 @@ CONFIDENCE_THRESHOLD = 0.6
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 
-# Configuración de ESPs
+# ── Backend de reconocimiento: "local" o "supabase" ──────────────────────────
+FACE_STORE = os.getenv("FACE_STORE", "local")  # switch principal
+
+# Supabase (solo se usa cuando FACE_STORE=supabase)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key
+
+# ── Configuración de ESPs
 ESP32_BRIDGE_URL = os.getenv("ESP32_BRIDGE_URL", "http://192.168.1.100")
 ESP32_CAM_URL = os.getenv("ESP32_CAM_URL", "http://192.168.1.101")
 

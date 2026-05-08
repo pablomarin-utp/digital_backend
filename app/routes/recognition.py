@@ -13,14 +13,19 @@ from app.models.schemas import (
     RetrainResponse,
     StatusResponse
 )
+from app.config import FACE_STORE
 from app.services.face_recognizer import FaceRecognizer
 from app.utils.image_utils import bytes_to_numpy, validate_image
 
-# Crear router
 router = APIRouter()
 
-# Instancia global del reconocedor
-face_recognizer = FaceRecognizer()
+if FACE_STORE == "supabase":
+    from app.services.face_store_supabase import SupabaseFaceRecognizer
+    face_recognizer = SupabaseFaceRecognizer()
+    print("✓ Face store: Supabase (pgvector)")
+else:
+    face_recognizer = FaceRecognizer()
+    print("✓ Face store: local (pickle)")
 
 
 @router.post("/recognize", response_model=RecognitionResponse)

@@ -17,4 +17,7 @@ dependencies = [
     "python-multipart>=0.0.20",
     "requests>=2.32.3",
     "httpx>=0.28.1",
+    "supabase>=2.10.0",
+    "python-dotenv>=1.0.0",
+    "dotenv>=0.9.9",
 ]
