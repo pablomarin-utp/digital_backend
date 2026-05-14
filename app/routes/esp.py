@@ -7,7 +7,7 @@ import asyncio
 from datetime import datetime
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from app.config import ESP32_BRIDGE_URL
@@ -40,6 +40,12 @@ class RegisterResponse(BaseModel):
 
 registered_devices: dict[str, str] = {}
 recent_recognitions: list[dict] = []
+
+# Estado del sensor — el ESP32 hace push aquí cada 500ms
+_sensor_state: dict = {"motion": False, "distance": -1.0}
+
+# Último frame recibido de la CAM (push desde la ESP32-CAM)
+_latest_frame: bytes | None = None
 
 # LED tracking — seguimos el estado local para no togglear innecesariamente
 _led_on: bool = False
@@ -87,19 +93,34 @@ async def get_devices():
 
 # ── Sensor y cámara ───────────────────────────────────────────────────────────
 
+@router.post("/motion")
+async def push_motion(request: Request):
+    """El ESP32 Bridge hace POST aquí cada 500ms con su estado."""
+    global _sensor_state
+    try:
+        data = await request.json()
+        _sensor_state = {
+            "motion":   bool(data.get("motion", False)),
+            "distance": float(data.get("distance", -1.0)),
+        }
+    except Exception:
+        pass
+    return {"ok": True}
+
+@router.post("/cam/frame")
+async def push_cam_frame(request: Request):
+    """La ESP32-CAM hace POST aquí con un JPEG cada ~1 s."""
+    global _latest_frame
+    _latest_frame = await request.body()
+    return {"ok": True}
+
 @router.get("/motion", response_model=MotionResponse)
 async def get_motion():
-    bridge_url = get_bridge_url()
-    if not bridge_url:
-        raise HTTPException(status_code=503, detail="ESP32 Bridge no registrado")
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{bridge_url}/api/motion")
-            r.raise_for_status()
-            data = r.json()
-            return MotionResponse(motion=data.get("motion", False), distance=data.get("distance"))
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Bridge no disponible: {e}")
+    """El frontend lee el último estado cacheado — sin llamar al ESP."""
+    return MotionResponse(
+        motion=_sensor_state["motion"],
+        distance=_sensor_state["distance"],
+    )
 
 @router.get("/cam_ip")
 async def get_cam_ip():
@@ -232,86 +253,85 @@ async def motion_capture_loop() -> None:
     global _led_on, _last_recognition_time
     from app.routes.recognition import face_recognizer
 
+    print("🚀 motion_capture_loop iniciado")
+
     motion_start: float | None = None
     loop = asyncio.get_event_loop()
 
     while True:
-        bridge_url = get_bridge_url()
-        cam_url = get_cam_url()
-
-        if not bridge_url or not cam_url:
-            motion_start = None
-            await asyncio.sleep(2)
-            continue
-
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                res = await client.get(f"{bridge_url}/api/motion")
-                motion: bool = res.json().get("motion", False)
-        except Exception:
-            motion_start = None
-            await asyncio.sleep(2)
-            continue
+            # Leer desde caché (ESP32 hace push cada 500 ms) — sin HTTP
+            motion: bool = _sensor_state["motion"]
+            now = loop.time()
 
-        now = loop.time()
-
-        if not motion:
-            motion_start = None
-            # Auto-apagado si han pasado LED_AUTO_OFF_SECS desde el último reconocimiento
-            if _led_on and (now - _last_recognition_time) > LED_AUTO_OFF_SECS:
-                await _set_bulb(bridge_url, False)
-            await asyncio.sleep(1)
-            continue
-
-        if motion_start is None:
-            motion_start = now
-            await asyncio.sleep(0.3)
-            continue
-
-        if (now - motion_start) < 0.5:
-            await asyncio.sleep(0.3)
-            continue
-
-        # 0.5 s de movimiento continuo → capturar y reconocer
-        motion_start = None
-
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                frame_res = await client.get(f"{cam_url}/capture")
-
-            if frame_res.status_code != 200:
-                await asyncio.sleep(3)
+            if not motion:
+                motion_start = None
+                # Auto-apagado si han pasado LED_AUTO_OFF_SECS desde el último reconocimiento
+                bridge_url = get_bridge_url()
+                if bridge_url and _led_on and (now - _last_recognition_time) > LED_AUTO_OFF_SECS:
+                    await _set_bulb(bridge_url, False)
+                await asyncio.sleep(0.2)
                 continue
 
-            img_array = bytes_to_numpy(frame_res.content)
+            if motion_start is None:
+                motion_start = now
+                print(f"📡 Movimiento detectado — dist={_sensor_state['distance']:.1f} cm")
+                await asyncio.sleep(0.1)
+                continue
+
+            if (now - motion_start) < 0.2:
+                await asyncio.sleep(0.1)
+                continue
+
+            # 0.2 s de movimiento continuo → reconocer con el último frame cacheado
+            motion_start = None
+            bridge_url = get_bridge_url()
+
+            if _latest_frame is None:
+                print("⚠️  Sin frame de CAM — esperando que la CAM haga push...")
+                await asyncio.sleep(1)
+                continue
+
+            print(f"🖼️  Usando frame cacheado ({len(_latest_frame)} bytes)")
+            img_array = bytes_to_numpy(_latest_frame)
             name, confidence, message = "Desconocido", 0.0, "Sin cara detectada"
             if img_array is not None:
+                print("🔍 Analizando rostro...")
+                t0 = loop.time()
                 _, rec_name, rec_conf, rec_msg = face_recognizer.recognize_face(img_array)
+                elapsed = loop.time() - t0
                 name = rec_name or "Desconocido"
                 confidence = round(rec_conf, 3) if rec_conf is not None else 0.0
                 message = rec_msg
+                print(f"   → {name} | sim={confidence:.2f} | {elapsed*1000:.0f} ms")
+            else:
+                print("⚠️  No se pudo decodificar la imagen de la CAM")
 
-            # Controlar LED: abre la puerta solo si conocido Y sobre el umbral
+            # Controlar LED
             door_open = (name != "Desconocido") and (confidence >= DOOR_OPEN_THRESHOLD)
-            await _set_bulb(bridge_url, door_open)
+            if bridge_url:
+                await _set_bulb(bridge_url, door_open)
 
-            now_dt = datetime.now()
             _last_recognition_time = now
 
             event = {
                 "name": name,
                 "confidence": confidence,
                 "message": message,
-                "timestamp": now_dt.isoformat(),
+                "timestamp": datetime.now().isoformat(),
                 "door": door_open,
             }
             recent_recognitions.insert(0, event)
             if len(recent_recognitions) > 10:
                 recent_recognitions.pop()
 
-            print(f"👤 {name} | sim={confidence:.2f} | puerta={'ABIERTA' if door_open else 'CERRADA'}")
+            print(f"{'🔓' if door_open else '🔒'} {name} | sim={confidence:.2f} | puerta={'ABIERTA' if door_open else 'CERRADA'}")
 
+        except asyncio.CancelledError:
+            print("🛑 motion_capture_loop cancelado")
+            return
         except Exception as e:
-            print(f"⚠️  Error: {e}")
+            print(f"💥 Error inesperado en loop: {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
 
-        await asyncio.sleep(3)  # cooldown
+        await asyncio.sleep(2)  # cooldown entre reconocimientos
