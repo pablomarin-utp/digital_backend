@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -12,6 +13,11 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from app.config import ESP32_BRIDGE_URL
 from app.utils.image_utils import bytes_to_numpy
+
+# Carpeta donde se guardan las capturas disparadas por el sensor de movimiento.
+# Sirve para verificar manualmente qué está viendo la ESP32-CAM.
+CAPTURES_DIR = Path(__file__).resolve().parent.parent.parent / "captures"
+CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter()
 
@@ -66,15 +72,16 @@ def get_cam_url() -> str | None:
     ip = registered_devices.get("cam")
     return f"http://{ip}" if ip else None
 
-async def _set_bulb(bridge_url: str, desired: bool) -> None:
+async def _set_external_bulb(bridge_url: str, desired: bool) -> None:
+    """Controla el BOMBILLO EXTERNO (LED_EXT, pin 26). El LED interno responde al sensor en el propio Bridge."""
     global _led_on
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             r = await client.post(f"{bridge_url}/api/led", json={"state": desired})
             _led_on = r.json().get("led", desired)
-        print(f"💡 Bombillo {'ENCENDIDO' if _led_on else 'APAGADO'}")
+        print(f"💡 Bombillo EXTERNO {'ENCENDIDO' if _led_on else 'APAGADO'}")
     except Exception as e:
-        print(f"⚠️  Error bombillo: {e}")
+        print(f"⚠️  Error bombillo externo: {e}")
 
 # ── Endpoints de registro y dispositivos ──────────────────────────────────────
 
@@ -250,12 +257,28 @@ async def get_recognitions():
 # ── Loop de captura + reconocimiento ─────────────────────────────────────────
 
 async def motion_capture_loop() -> None:
+    """
+    Loop de control del BOMBILLO EXTERNO. El LED interno del Bridge ya se
+    enciende localmente en el ESP cuando el sensor detecta movimiento — no
+    pasa por aquí. Aquí solo decidimos si encender el externo en base al
+    reconocimiento facial.
+
+    Flujo:
+      sensor detecta movimiento  →  Bridge prende LED interno (local)
+                                 →  Bridge POSTea /motion al backend (este loop lo ve)
+      este loop espera 100 ms de movimiento sostenido
+                                 →  toma el último frame cacheado de la CAM
+                                 →  embedder.get_embedding → similitud coseno
+                                 →  si conocido (sim >= 0.75) → prende BOMBILLO EXTERNO
+      sin movimiento por LED_AUTO_OFF_SECS → apaga BOMBILLO EXTERNO
+    """
     global _led_on, _last_recognition_time
     from app.routes.recognition import face_recognizer
 
     print("🚀 motion_capture_loop iniciado")
 
     motion_start: float | None = None
+    prev_motion = False
     loop = asyncio.get_event_loop()
 
     while True:
@@ -264,53 +287,69 @@ async def motion_capture_loop() -> None:
             motion: bool = _sensor_state["motion"]
             now = loop.time()
 
+            # Log de transición — solo cuando cambia el estado
+            if motion != prev_motion:
+                if motion:
+                    print(f"📡 MOVIMIENTO detectado — dist={_sensor_state['distance']:.1f} cm — LED interno del Bridge ya prendido (local)")
+                else:
+                    print("🌫️  Sin movimiento")
+                prev_motion = motion
+
             if not motion:
                 motion_start = None
-                # Auto-apagado si han pasado LED_AUTO_OFF_SECS desde el último reconocimiento
+                # Auto-apagado del BOMBILLO EXTERNO si pasan LED_AUTO_OFF_SECS sin actividad
                 bridge_url = get_bridge_url()
                 if bridge_url and _led_on and (now - _last_recognition_time) > LED_AUTO_OFF_SECS:
-                    await _set_bulb(bridge_url, False)
-                await asyncio.sleep(0.2)
+                    await _set_external_bulb(bridge_url, False)
+                await asyncio.sleep(0.1)
                 continue
 
             if motion_start is None:
                 motion_start = now
-                print(f"📡 Movimiento detectado — dist={_sensor_state['distance']:.1f} cm")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
-            if (now - motion_start) < 0.2:
-                await asyncio.sleep(0.1)
+            # 100 ms de movimiento sostenido → intentar reconocer
+            if (now - motion_start) < 0.1:
+                await asyncio.sleep(0.05)
                 continue
 
-            # 0.2 s de movimiento continuo → reconocer con el último frame cacheado
             motion_start = None
             bridge_url = get_bridge_url()
 
             if _latest_frame is None:
-                print("⚠️  Sin frame de CAM — esperando que la CAM haga push...")
-                await asyncio.sleep(1)
+                print("⚠️  Sin frame de CAM — esperando push (CAM envía cada 1 s)...")
+                await asyncio.sleep(0.5)
                 continue
 
-            print(f"🖼️  Usando frame cacheado ({len(_latest_frame)} bytes)")
+            # Guardar la captura a disco para inspección manual.
+            # Sirve para confirmar qué está enviando la ESP32-CAM realmente.
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                capture_path = CAPTURES_DIR / f"motion_{ts}.jpg"
+                capture_path.write_bytes(_latest_frame)
+                print(f"📸 Captura guardada: {capture_path}")
+            except Exception as e:
+                print(f"⚠️  No se pudo guardar captura: {e}")
+
             img_array = bytes_to_numpy(_latest_frame)
             name, confidence, message = "Desconocido", 0.0, "Sin cara detectada"
             if img_array is not None:
-                print("🔍 Analizando rostro...")
+                print(f"🔍 Reconociendo (frame {len(_latest_frame)} bytes)...")
                 t0 = loop.time()
                 _, rec_name, rec_conf, rec_msg = face_recognizer.recognize_face(img_array)
                 elapsed = loop.time() - t0
                 name = rec_name or "Desconocido"
                 confidence = round(rec_conf, 3) if rec_conf is not None else 0.0
                 message = rec_msg
-                print(f"   → {name} | sim={confidence:.2f} | {elapsed*1000:.0f} ms")
+                print(f"   → {name} | similitud_coseno={confidence:.2f} | {elapsed*1000:.0f} ms")
             else:
                 print("⚠️  No se pudo decodificar la imagen de la CAM")
 
-            # Controlar LED
-            door_open = (name != "Desconocido") and (confidence >= DOOR_OPEN_THRESHOLD)
+            # Bombillo EXTERNO: solo prende si la cara está registrada con confianza
+            should_open = (name != "Desconocido") and (confidence >= DOOR_OPEN_THRESHOLD)
             if bridge_url:
-                await _set_bulb(bridge_url, door_open)
+                await _set_external_bulb(bridge_url, should_open)
 
             _last_recognition_time = now
 
@@ -319,13 +358,13 @@ async def motion_capture_loop() -> None:
                 "confidence": confidence,
                 "message": message,
                 "timestamp": datetime.now().isoformat(),
-                "door": door_open,
+                "door": should_open,
             }
             recent_recognitions.insert(0, event)
             if len(recent_recognitions) > 10:
                 recent_recognitions.pop()
 
-            print(f"{'🔓' if door_open else '🔒'} {name} | sim={confidence:.2f} | puerta={'ABIERTA' if door_open else 'CERRADA'}")
+            print(f"{'🔓' if should_open else '🔒'} {name} | sim={confidence:.2f} | bombillo externo={'ON' if should_open else 'OFF'}")
 
         except asyncio.CancelledError:
             print("🛑 motion_capture_loop cancelado")
@@ -334,4 +373,4 @@ async def motion_capture_loop() -> None:
             print(f"💥 Error inesperado en loop: {type(e).__name__}: {e}")
             await asyncio.sleep(1)
 
-        await asyncio.sleep(2)  # cooldown entre reconocimientos
+        await asyncio.sleep(1)  # cooldown entre reconocimientos
