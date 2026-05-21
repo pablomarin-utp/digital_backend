@@ -254,6 +254,19 @@ async def get_recognitions():
     """Últimos eventos de reconocimiento generados por el loop de captura."""
     return recent_recognitions
 
+
+@router.get("/captures/{filename}")
+async def get_capture(filename: str):
+    """Devuelve una imagen guardada por el loop de reconocimiento."""
+    # Evita path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Nombre inválido")
+    path = CAPTURES_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Captura no encontrada")
+    return Response(content=path.read_bytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"})
+
 # ── Loop de captura + reconocimiento ─────────────────────────────────────────
 
 async def motion_capture_loop() -> None:
@@ -324,13 +337,16 @@ async def motion_capture_loop() -> None:
 
             # Guardar la captura a disco para inspección manual.
             # Sirve para confirmar qué está enviando la ESP32-CAM realmente.
+            capture_filename: str | None = None
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                capture_path = CAPTURES_DIR / f"motion_{ts}.jpg"
+                capture_filename = f"motion_{ts}.jpg"
+                capture_path = CAPTURES_DIR / capture_filename
                 capture_path.write_bytes(_latest_frame)
                 print(f"📸 Captura guardada: {capture_path}")
             except Exception as e:
                 print(f"⚠️  No se pudo guardar captura: {e}")
+                capture_filename = None
 
             img_array = bytes_to_numpy(_latest_frame)
             name, confidence, message = "Desconocido", 0.0, "Sin cara detectada"
@@ -359,6 +375,7 @@ async def motion_capture_loop() -> None:
                 "message": message,
                 "timestamp": datetime.now().isoformat(),
                 "door": should_open,
+                "file": capture_filename,
             }
             recent_recognitions.insert(0, event)
             if len(recent_recognitions) > 10:
